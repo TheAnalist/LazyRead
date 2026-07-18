@@ -1,95 +1,133 @@
+"""
+Eye-Tracking Scroll Controller
+--------------------------------
+Scrolls the screen up/down based on vertical eye movement, detected via
+MediaPipe FaceMesh landmarks. See README.md for setup and usage.
+"""
+
+import time
+
 import cv2
 import mediapipe as mp
 import numpy as np
-import time
-import pyautogui 
+import pyautogui
 
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True, max_num_faces=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
-
-cap = cv2.VideoCapture(0)
-
-# define indices for left and right eye landmarks based on MediaPipe's face mesh model
+# ---- Config ---------------------------------------------------------------
 LEFT_EYE_INDICES = [33, 133, 160, 159, 158, 144, 153, 145, 246]
 RIGHT_EYE_INDICES = [362, 263, 387, 386, 385, 373, 380, 374, 466]
 
-# initialize variables to store eye positions and calibration status
-locked_left_eye = None
-locked_right_eye = None
-calibration_done = False
-initial_left_eye_centroid = None
-initial_right_eye_centroid = None
+CALIBRATION_TIME = 5          # seconds
+SCROLL_UP_THRESHOLD = 5       # pixels
+SCROLL_DOWN_THRESHOLD = 5     # pixels
+SCROLL_AMOUNT = 10
+COOLDOWN = 0.3                # seconds between scroll actions (prevents spamming)
 
-calibration_time = 5  
-start_time = time.time()
+pyautogui.FAILSAFE = True     # move mouse to a screen corner to abort pyautogui
 
-# capture frames from webcam
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
 
-    h, w, _ = frame.shape
+def get_eye_points(landmarks, indices, w, h):
+    return np.array(
+        [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in indices]
+    )
 
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    results = face_mesh.process(rgb_frame)
+def main():
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        refine_landmarks=True,
+        max_num_faces=1,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
 
-    if results.multi_face_landmarks:
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open webcam. Check the camera index/permissions.")
 
-        for face_landmarks in results.multi_face_landmarks:
+    calibration_done = False
+    initial_left_centroid = None
+    initial_right_centroid = None
+    start_time = time.time()
+    last_scroll_time = 0.0
 
-            #  get positions of left and right eye landmarks
-            left_eye = [(int(landmark.x * w), int(landmark.y * h)) for i, landmark in enumerate(face_landmarks.landmark) if i in LEFT_EYE_INDICES]
-            right_eye = [(int(landmark.x * w), int(landmark.y * h)) for i, landmark in enumerate(face_landmarks.landmark) if i in RIGHT_EYE_INDICES]
-
-            for point in left_eye:
-                cv2.circle(frame, point, 2, (0, 255, 0), -1)
-            for point in right_eye:
-                cv2.circle(frame, point, 2, (0, 255, 0), -1)
-
-            if not calibration_done:
-
-                left_x, left_y, left_w, left_h = cv2.boundingRect(np.array(left_eye))
-                right_x, right_y, right_w, right_h = cv2.boundingRect(np.array(right_eye))
-
-                initial_left_eye_centroid = (left_x + left_w // 2, left_y + left_h // 2)
-                initial_right_eye_centroid = (right_x + right_w // 2, right_y + right_h // 2)
-
-                elapsed_time = time.time() - start_time
-                cv2.putText(frame, f"Open your eyes wide! Calibration in progress...", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                cv2.putText(frame, f"Time remaining: {int(calibration_time - elapsed_time)}s", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-                if elapsed_time >= calibration_time:
-                    locked_left_eye = (left_x, left_y, left_w, left_h)
-                    locked_right_eye = (right_x, right_y, right_w, right_h)
-                    calibration_done = True
-                    cv2.putText(frame, "Calibration complete!", (50, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-            if calibration_done:
-                current_left_eye_centroid = np.mean(left_eye, axis=0).astype(int)
-                current_right_eye_centroid = np.mean(right_eye, axis=0).astype(int)
-
-                # define thresholds for scrolling actions 
-                scroll_up_threshold = 5  
-                scroll_down_threshold = 5  
-
-                # determine scrolling direction 
-                if current_left_eye_centroid[1] - initial_left_eye_centroid[1] > scroll_down_threshold or current_right_eye_centroid[1] - initial_right_eye_centroid[1] > scroll_down_threshold:
-                    pyautogui.scroll(-10)  
-                    cv2.putText(frame, "Scrolling down!", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-                elif current_left_eye_centroid[1] - initial_left_eye_centroid[1] < -scroll_up_threshold or current_right_eye_centroid[1] - initial_right_eye_centroid[1] < -scroll_up_threshold:
-                    pyautogui.scroll(10)  
-                    cv2.putText(frame, "Scrolling up!", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-    
     cv2.namedWindow("Eye Tracking and Scrolling", cv2.WINDOW_NORMAL)
-    cv2.imshow("Eye Tracking and Scrolling", frame)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame = cv2.flip(frame, 1)  # mirror view, feels more natural
+            h, w, _ = frame.shape
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(rgb_frame)
+
+            if results.multi_face_landmarks:
+                landmarks = results.multi_face_landmarks[0].landmark
+
+                left_eye = get_eye_points(landmarks, LEFT_EYE_INDICES, w, h)
+                right_eye = get_eye_points(landmarks, RIGHT_EYE_INDICES, w, h)
+
+                for point in left_eye:
+                    cv2.circle(frame, tuple(point), 2, (0, 255, 0), -1)
+                for point in right_eye:
+                    cv2.circle(frame, tuple(point), 2, (0, 255, 0), -1)
+
+                if not calibration_done:
+                    initial_left_centroid = left_eye.mean(axis=0).astype(int)
+                    initial_right_centroid = right_eye.mean(axis=0).astype(int)
+
+                    elapsed = time.time() - start_time
+                    remaining = max(0, int(CALIBRATION_TIME - elapsed))
+                    cv2.putText(frame, "Look straight ahead - calibrating...",
+                                (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    cv2.putText(frame, f"Time remaining: {remaining}s",
+                                (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                    if elapsed >= CALIBRATION_TIME:
+                        calibration_done = True
+
+                else:
+                    current_left_centroid = left_eye.mean(axis=0).astype(int)
+                    current_right_centroid = right_eye.mean(axis=0).astype(int)
+
+                    left_dy = current_left_centroid[1] - initial_left_centroid[1]
+                    right_dy = current_right_centroid[1] - initial_right_centroid[1]
+
+                    now = time.time()
+                    if now - last_scroll_time > COOLDOWN:
+                        if left_dy > SCROLL_DOWN_THRESHOLD or right_dy > SCROLL_DOWN_THRESHOLD:
+                            pyautogui.scroll(-SCROLL_AMOUNT)
+                            last_scroll_time = now
+                            cv2.putText(frame, "Scrolling down", (50, 50),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        elif left_dy < -SCROLL_UP_THRESHOLD or right_dy < -SCROLL_UP_THRESHOLD:
+                            pyautogui.scroll(SCROLL_AMOUNT)
+                            last_scroll_time = now
+                            cv2.putText(frame, "Scrolling up", (50, 50),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            else:
+                cv2.putText(frame, "No face detected", (50, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            cv2.putText(frame, "Press 'q' to quit, 'r' to recalibrate", (50, h - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+            cv2.imshow("Eye Tracking and Scrolling", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('r'):
+                calibration_done = False
+                start_time = time.time()
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        face_mesh.close()
+
 
 if __name__ == "__main__":
-    cap.release()
-    cv2.destroyAllWindows()
-
+    main()
