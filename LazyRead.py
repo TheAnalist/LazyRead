@@ -122,6 +122,7 @@ MODEL_PATH = os.path.join(
 MODEL_HAND_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "models", "hand_landmarker.task"
 )
+WINDOW_NAME = "LazyRead"  # OpenCV preview window
 pyautogui.FAILSAFE = True  # move mouse to a screen corner to abort pyautogui
 
 
@@ -195,6 +196,15 @@ def draw_progress(frame, progress, y=95):
     cv2.rectangle(
         frame, (x0, y), (x0 + int(width * progress), y + height), (0, 255, 255), -1
     )
+
+
+def window_is_open(name=WINDOW_NAME):
+    """False once the user closes the preview window with the X button."""
+    try:
+        return cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE) >= 1
+    except cv2.error:
+        # The window handle is already gone.
+        return False
 
 
 def angle_deg(a, b, c):
@@ -399,7 +409,8 @@ def main():
     last_hand_landmarks = []
     last_hand_ok = []
 
-    cv2.namedWindow("LazyRead", cv2.WINDOW_NORMAL)
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    window_ready = False
 
     try:
         while cap.isOpened():
@@ -622,9 +633,16 @@ def main():
                 1,
             )
 
-            cv2.imshow("LazyRead", frame)
+            # Once the X button destroys the window, the next imshow would
+            # recreate it (with a fresh size): stop before that happens.
+            if window_ready and not window_is_open():
+                break
+            cv2.imshow(WINDOW_NAME, frame)
+            window_ready = True
 
             key = cv2.waitKey(1) & 0xFF
+            if not window_is_open():
+                break
             if key == ord("q"):
                 break
             elif key == ord("r"):
@@ -632,15 +650,24 @@ def main():
             # stop tracking for a bit
             # waits for key "k" to be re-typed
             elif key == ord("k"):
-                stop_key = cv2.waitKey(1) & 0xFF
-                while stop_key != ord("k") or stop_key == ord("q"):
-                    stop_key = cv2.waitKey(1) & 0xFF
                 scroll_ramp.reset()
                 last_scroll_time = time.time()
+                resumed = False
+                while not resumed and window_is_open():
+                    stop_key = cv2.waitKey(1) & 0xFF
+                    if stop_key == ord("k"):
+                        resumed = True
+                    elif stop_key == ord("q"):
+                        break
+                if not resumed:
+                    break
 
     finally:
         cap.release()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
         face_landmarker.close()
         hand_landmarker.close()
 

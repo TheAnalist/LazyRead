@@ -65,6 +65,7 @@ Hand landmarks are drawn too: **green dots** mean the open-hand gesture was reco
 
 ## What changed from AutoScroller
 - Rebranded as **LazyRead**: the entry point is now `LazyRead.py` and the preview window is titled `LazyRead`.
+- Closing the preview window with the X button now exits cleanly instead of letting `imshow` recreate it.
 - Added a lateral tolerance container: small sideways head movements are ignored, while a real lateral shift re-locks the vertical baseline automatically.
 - Removed dead code (`locked_left_eye` / `locked_right_eye` were computed but never used).
 - Fixed structure: previously the capture loop ran at import time regardless of `__main__`, and cleanup only ran inside the `__main__` guard — this could leak the camera handle. Now everything is wrapped in `main()` and released in a `finally` block, so the webcam is released even if an error occurs.
