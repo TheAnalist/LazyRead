@@ -52,6 +52,7 @@ Hand landmarks are drawn too: **green dots** mean the open-hand gesture was reco
 - Small, deliberate up/down **head** movements trigger scrolling; moving only your eyes (gaze) has little effect. Normal blinking won't trigger anything.
 - **Hand re-calibration:** raise your hand with all five fingers extended and the palm (or back of the hand) facing the camera, like a "stop" gesture, and hold it for a moment. Green landmark dots confirm the pose; orange dots mean it was not recognised.
 - **Privacy mode (`p`):** the face is replaced by a solid gray box and everything else is pixelated. Detection still runs on the untouched frame, so scrolling is unaffected. Use it when recording a demo.
+- **Pause (`k`):** releases the webcam (LED off, models idle) and reopens/recalibrates when you press `k` again.
 - **Ctrl pauses scrolling:** while Ctrl is held, no wheel events are sent, so browser/PDF zoom shortcuts (Ctrl+wheel) do not fire. Release Ctrl to resume. Works on Windows, macOS and Unix/X11; on Wayland the global key state may not be readable, in which case the guard is simply inactive.
 - If scrolling feels too sensitive or too sluggish, tweak these constants near the top of `LazyRead.py`:
   - `SCROLL_UP_THRESHOLD` / `SCROLL_DOWN_THRESHOLD` — how far your **face** must move (in pixels, measured from the face box) to trigger a scroll
@@ -64,8 +65,10 @@ Hand landmarks are drawn too: **green dots** mean the open-hand gesture was reco
   - `HAND_FINGER_MIN_ANGLE` — joint angle (degrees) above which a finger counts as extended; lower it if your thumb is not recognised
   - `HAND_PALM_MIN_FACING` — how front-facing the palm must be (0–1, higher = stricter)
   - `HAND_CONFIRM_CHECKS` / `HAND_RELEASE_CHECKS` — consecutive checks needed to trigger and to re-arm the gesture
-  - `HAND_CHECK_EVERY` — runs the hand model every N frames (1 = every frame, higher = lighter CPU)
+  - `HAND_CHECK_EVERY` — runs the hand model every N frames (default 4; 1 = every frame, higher = lighter CPU)
   - `PRIVACY_MODE` — start with the privacy preview on/off (toggle with `p`)
+  - `CAPTURE_WIDTH` / `CAPTURE_HEIGHT` / `TARGET_FPS` — capture settings (default 480×360 @ 15 fps)
+  - `IDLE_AFTER_SECONDS` / `IDLE_FPS` — idle mode when no face is visible
   - `PRIVACY_BOX_COLOR`, `PRIVACY_FACE_PADDING`, `PRIVACY_PIXEL_BLOCK` — face-cover color, extra margin (30%) and pixelation block size (16 px)
 - Move your mouse to a screen corner at any time to trigger pyautogui's fail-safe and stop automated input immediately.
 
@@ -73,6 +76,7 @@ Hand landmarks are drawn too: **green dots** mean the open-hand gesture was reco
 - Rebranded as **LazyRead**: the entry point is now `LazyRead.py` and the preview window is titled `LazyRead`.
 - Closing the preview window with the X button now exits cleanly instead of letting `imshow` recreate it.
 - Scrolling pauses while Ctrl is held, so Ctrl+wheel does not zoom the page being scrolled.
+- Reduced CPU/battery use: 480×360 @ 15 fps capture, hand model every 4 frames and only while tracking, 5 fps idle mode with no face, and the camera is released while paused.
 - Added a privacy preview (dark face box + pixelated background), toggled with `p`, for demos that must not show the user or the room.
 - Added a lateral tolerance container: small sideways head movements are ignored, while a real lateral shift re-locks the vertical baseline automatically.
 - Removed dead code (`locked_left_eye` / `locked_right_eye` were computed but never used).
@@ -91,7 +95,7 @@ LazyRead is a fork of [DissanayakeLYB/AutoScroller](https://github.com/Dissanaya
 ## Face-area calibration
 - During calibration the script records the face's bounding box (from 36 face-oval landmarks, not all 478, so it stays cheap). Its centre and size are averaged with a **median**, which is why 2 s are enough: blinks and single bad frames are ignored.
 - The vertical scroll signal is the **face-box centre** relative to that baseline: head translation moves it directly, while moving just your eyes does not. The eye landmarks are no longer read.
-- While tracking, the face-box centre is compared with the baseline every frame. A **tolerance container** of ±`FACE_CONTAINER_X_PX` × ±`FACE_CONTAINER_Y_PX` pixels around the baseline is drawn in gray: small sideways shifts inside it are ignored, but leaving it for `FACE_MOVE_FRAMES` consecutive frames discards the baseline and re-locks in ~1 s, so the next vertical gesture starts from a fresh position. Box size changes beyond `FACE_SIZE_TOLERANCE` also trigger a re-lock (leaning in/out).
+- While tracking, the face-box centre is compared with the baseline every frame. A **tolerance container** of ±`FACE_CONTAINER_X_PX` × ±`FACE_CONTAINER_Y_PX` reference pixels (tuned at 640×480 and scaled automatically to the capture size) around the baseline is drawn in gray: small sideways shifts inside it are ignored, but leaving it for `FACE_MOVE_FRAMES` consecutive frames discards the baseline and re-locks in ~1 s, so the next vertical gesture starts from a fresh position. Box size changes beyond `FACE_SIZE_TOLERANCE` also trigger a re-lock (leaning in/out).
 - The lateral tolerance is the point of the container: the head never stays perfectly still, so lateral jitter should not cost a re-calibration. When the drift is real, the re-lock is actually useful: it re-centres the vertical reference before the next up/down movement.
 - If the face is not detected for `FACE_LOST_FRAMES` frames, the old baseline is discarded too; when the face comes back, calibration restarts from the new position.
 - MediaPipe's VIDEO mode already re-detects the face when tracking is lost, so "finding it again" needs no extra inference pass.
@@ -103,7 +107,7 @@ LazyRead is a fork of [DissanayakeLYB/AutoScroller](https://github.com/Dissanaya
 - Fist, pointing, victory, thumbs-up and hands seen edge-on fail the angle or palm-plane test, so ordinary hand movements do not reset the calibration.
 - The trigger is **edge-based**: it fires after `HAND_CONFIRM_CHECKS` consecutive positive checks and stays latched until the hand disappears for `HAND_RELEASE_CHECKS` checks. This is why holding the open hand does not cause an endless recalibration loop.
 - A gesture shown during the initial calibration is ignored (the calibration is already running); lower the hand and show it again afterwards.
-- The hand model is the expensive one (~12 ms/frame with one hand, ~23 ms with two, vs ~3 ms for the face), so it runs every `HAND_CHECK_EVERY` frames (default 2). With the face model also running, the whole loop costs ~12–13 ms/frame on CPU.
+- The hand model is the expensive one (~12 ms/frame with one hand, ~23 ms with two, vs ~3 ms for the face), so it runs every `HAND_CHECK_EVERY` frames (default 4) and **only while a face is tracked and calibration is complete**. During calibration, recalibration or with no face it is not called at all. With the face model also running, the whole loop costs ~12–13 ms/frame on CPU.
 
 ## Privacy mode
 - Detection, calibration and scrolling always use the **original frame**. Privacy mode only builds the preview: the frame is pixelated (block size `PRIVACY_PIXEL_BLOCK`), then the detected face is replaced by a solid `PRIVACY_BOX_COLOR` rectangle expanded by `PRIVACY_FACE_PADDING` (30%).
@@ -116,6 +120,15 @@ LazyRead is a fork of [DissanayakeLYB/AutoScroller](https://github.com/Dissanaya
 - Keep privacy mode on and record the LazyRead window next to the page you are scrolling.
 - Use a clean browser profile (no personal tabs, bookmarks or notifications) and a plain background.
 - For the README a 5–8 s GIF under ~10 MB works well; strip metadata with `ffmpeg -map_metadata -1`.
+
+## Battery and performance
+- The webcam is opened at 480×360 and asked for 15 fps (`CAPTURE_WIDTH`, `CAPTURE_HEIGHT`, `TARGET_FPS`). If the camera offers a different size, the actual frame size is used and the scroll/container thresholds stay in **640×480 reference pixels** (`REFERENCE_WIDTH` / `REFERENCE_HEIGHT`), so the feel does not change.
+- A loop limiter caps processing at 15 fps even if the camera ignores the request. The sensor may still run faster, but CPU work is bounded.
+- The hand model runs every `HAND_CHECK_EVERY` frames (default 4) and only while a face is tracked and calibration is complete.
+- After `IDLE_AFTER_SECONDS` (default 3 s) without a face the loop drops to `IDLE_FPS` (default 5) until a face returns.
+- Pausing with `k` releases the camera (LED off) and idles both models; resuming reopens the camera and recalibrates.
+- `pyautogui.PAUSE = 0` removes the 0.1 s sleep after each scroll; `COOLDOWN` still limits scroll events.
+- Net effect: roughly half the CPU in normal use and near-zero camera/model work while paused.
 
 ## Known limitations
 - This is **face-position tracking, not gaze tracking**: nodding, leaning or shifting your posture scrolls the page, and moving your eyes alone has little effect. That is the intended behaviour of this project; automatic re-calibration resets the reference after large movements.

@@ -78,11 +78,21 @@ CALIBRATION_MAX_SAMPLES = 120  # ~4 s at 30 fps, keeps memory bounded
 # consecutive frames re-locks the reference, so the next up/down gesture starts
 # from a fresh position. The vertical margin is deliberately wider than the
 # scroll range, so normal scrolling does not interrupt tracking.
-FACE_CONTAINER_X_PX = 80  # lateral half-width, in pixels
-FACE_CONTAINER_Y_PX = 140  # vertical half-height, in pixels
+FACE_CONTAINER_X_PX = 80  # lateral half-width, in 640x480 reference pixels
+FACE_CONTAINER_Y_PX = 140  # vertical half-height, in 640x480 reference pixels
 FACE_SIZE_TOLERANCE = 0.30  # relative change of the box width/height
 FACE_MOVE_FRAMES = 6  # consecutive frames outside the container before re-locking
 FACE_LOST_FRAMES = 10  # consecutive frames without a face before resetting
+
+# Camera and battery/performance --------------------------------------------
+CAMERA_INDEX = 0
+CAPTURE_WIDTH = 480
+CAPTURE_HEIGHT = 360
+TARGET_FPS = 15
+REFERENCE_WIDTH = 640  # scroll/container thresholds are tuned at this size
+REFERENCE_HEIGHT = 480
+IDLE_AFTER_SECONDS = 3.0  # no face for this long -> lower processing rate
+IDLE_FPS = 5
 
 # Privacy mode for the preview: the detected face is replaced by a solid dark
 # box and the rest of the frame is pixelated, so a demo recording never shows
@@ -92,8 +102,8 @@ PRIVACY_BOX_COLOR = (35, 35, 35)  # BGR dark gray
 PRIVACY_FACE_PADDING = 0.30  # expand the face box to cover hair/ears/chin
 PRIVACY_PIXEL_BLOCK = 16  # pixelation block size, in pixels
 
-SCROLL_UP_THRESHOLD = 7.8  # pixels
-SCROLL_DOWN_THRESHOLD = 7.5  # pixels
+SCROLL_UP_THRESHOLD = 7.8  # 640x480 reference pixels
+SCROLL_DOWN_THRESHOLD = 7.5  # 640x480 reference pixels
 COOLDOWN = 0.4  # seconds between scroll actions (prevents spamming)
 
 SCROLL_AMOUNT = 10
@@ -114,7 +124,7 @@ HAND_FINGER_JOINTS = (
 HAND_FINGER_MIN_ANGLE = 145.0  # degrees at the joint (180 = perfectly straight)
 HAND_PALM_MIN_FACING = 0.6  # |normal.z| / |normal| (1.0 = palm parallel to image)
 HAND_MIN_CONFIDENCE = 0.7  # handedness score reported by the model
-HAND_CHECK_EVERY = 2  # run the hand model every N frames (saves CPU)
+HAND_CHECK_EVERY = 4  # run the hand model every N frames (saves CPU)
 HAND_CONFIRM_CHECKS = 3  # consecutive positive checks needed to trigger
 HAND_RELEASE_CHECKS = 3  # consecutive negative checks needed to re-arm
 
@@ -135,6 +145,7 @@ MODEL_HAND_PATH = os.path.join(
 WINDOW_NAME = "LazyRead"  # OpenCV preview window
 VK_CONTROL = 0x11  # Win32 virtual-key code for the Ctrl key
 pyautogui.FAILSAFE = True  # move mouse to a screen corner to abort pyautogui
+pyautogui.PAUSE = 0  # do not sleep 0.1 s after every scroll call
 
 
 def ensure_model(path=MODEL_PATH, url=MODEL_URL):
@@ -447,21 +458,22 @@ class Calibration:
         self.moved_frames = 0
         return True
 
-    def face_left_container(self, center, size, w, h):
+    def face_left_container(self, center, size):
         """True if the face stayed outside the tolerance container for a while.
 
         The container is a box of +/- FACE_CONTAINER_X_PX and
-        +/- FACE_CONTAINER_Y_PX around the baseline centre. Small lateral
-        shifts are tolerated; a real sideways movement re-locks the reference
-        so the vertical baseline is fresh for the next scroll gesture. The
-        vertical margin is larger than the scroll range, so scrolling does not
-        trigger a re-lock.
+        +/- FACE_CONTAINER_Y_PX around the baseline centre, in 640x480
+        reference pixels, so the behaviour is independent of the capture
+        resolution. Small lateral shifts are tolerated; a real sideways
+        movement re-locks the reference so the vertical baseline is fresh for
+        the next scroll gesture. The vertical margin is larger than the scroll
+        range, so scrolling does not trigger a re-lock.
         """
         if not self.done:
             return False
 
-        dx = abs(center[0] - self.center[0]) * w
-        dy = abs(center[1] - self.center[1]) * h
+        dx = abs(center[0] - self.center[0]) * REFERENCE_WIDTH
+        dy = abs(center[1] - self.center[1]) * REFERENCE_HEIGHT
         dw = abs(size[0] - self.size[0]) / max(self.size[0], 1e-6)
         dh = abs(size[1] - self.size[1]) / max(self.size[1], 1e-6)
 
@@ -478,11 +490,13 @@ class Calibration:
     def container_box(self, w, h):
         """Pixel box of the tolerated face-centre movement."""
         cx, cy = self.center
+        half_x = FACE_CONTAINER_X_PX * w / REFERENCE_WIDTH
+        half_y = FACE_CONTAINER_Y_PX * h / REFERENCE_HEIGHT
         return (
-            cx * w - FACE_CONTAINER_X_PX,
-            cy * h - FACE_CONTAINER_Y_PX,
-            cx * w + FACE_CONTAINER_X_PX,
-            cy * h + FACE_CONTAINER_Y_PX,
+            cx * w - half_x,
+            cy * h - half_y,
+            cx * w + half_x,
+            cy * h + half_y,
         )
 
     def baseline_box(self, w, h):
@@ -495,6 +509,25 @@ class Calibration:
             (cx + bw / 2) * w,
             (cy + bh / 2) * h,
         )
+
+
+def open_camera(index=CAMERA_INDEX):
+    """Open the webcam with the low-power capture settings."""
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        return cap
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    print(
+        "Camera: "
+        f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+        f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ "
+        f"{cap.get(cv2.CAP_PROP_FPS):.0f} fps"
+    )
+    return cap
 
 
 def main():
@@ -520,7 +553,7 @@ def main():
     face_landmarker = vision.FaceLandmarker.create_from_options(options)
     hand_landmarker = vision.HandLandmarker.create_from_options(hand_options)
 
-    cap = cv2.VideoCapture(0)
+    cap = open_camera()
     if not cap.isOpened():
         face_landmarker.close()
         hand_landmarker.close()
@@ -531,6 +564,7 @@ def main():
     last_scroll_time = 0.0
     last_timestamp_ms = 0
     missing_frames = 0
+    last_face_seen = time.monotonic()
 
     hand_check_frame = 0
     hand_gesture_checks = 0
@@ -546,7 +580,12 @@ def main():
 
     try:
         while cap.isOpened():
-            ret, frame = cap.read()
+            frame_start = time.monotonic()
+            for _ in range(5):
+                ret, frame = cap.read()
+                if ret:
+                    break
+                time.sleep(0.05)
             if not ret:
                 break
 
@@ -570,12 +609,15 @@ def main():
             results = face_landmarker.detect_for_video(mp_image, timestamp_ms)
 
             # Hand gesture, throttled (the hand model is only needed a few
-            # times per second). The trigger is edge-based: it fires once when
-            # the open hand has been held for a few checks and only re-arms
-            # after the hand is lowered or closed.
+            # times per second) and only while tracking is running: during
+            # calibration or with no face there is nothing it could trigger.
+            # The trigger is edge-based: it fires once when the open hand has
+            # been held for a few checks and only re-arms after the hand is
+            # lowered or closed.
             hand_check_frame += 1
             hand_request_recalibration = False
-            if hand_check_frame % HAND_CHECK_EVERY == 0:
+            hand_allowed = bool(results.face_landmarks) and calibration.done
+            if hand_allowed and hand_check_frame % HAND_CHECK_EVERY == 0:
                 hand_results = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
                 last_hand_landmarks = hand_results.hand_landmarks
                 last_hand_ok = [
@@ -597,6 +639,10 @@ def main():
                 if hand_gesture_checks >= HAND_CONFIRM_CHECKS and not hand_latched:
                     hand_latched = True
                     hand_request_recalibration = True
+            elif not hand_allowed:
+                last_hand_landmarks = []
+                last_hand_ok = []
+                hand_gesture_checks = 0
 
             # Green dots = recognised open hand, orange = hand doing something
             # else (so it is clear why a recalibration did not start).
@@ -606,6 +652,7 @@ def main():
                     cv2.circle(frame, (int(lm.x * w), int(lm.y * h)), 2, color, -1)
 
             if results.face_landmarks:
+                last_face_seen = time.monotonic()
                 # Face found again after a loss: the old baseline is meaningless.
                 if missing_frames >= FACE_LOST_FRAMES:
                     calibration.reset(RECALIBRATION_TIME)
@@ -677,7 +724,7 @@ def main():
                         draw_progress(frame, calibration.progress())
                         draw_box(frame, box, (0, 255, 255), 1)
 
-                elif calibration.face_left_container(center, size, w, h):
+                elif calibration.face_left_container(center, size):
                     # Face left the tolerance container: re-lock the reference
                     # in this new position, ready for the next scroll gesture.
                     calibration.reset(RECALIBRATION_TIME)
@@ -715,8 +762,9 @@ def main():
                     draw_box(frame, calibration.baseline_box(w, h), (0, 150, 150), 1)
                     draw_box(frame, box, (0, 255, 0), 1)
 
-                    # Vertical movement of the face centre, in pixels.
-                    dy = (center[1] - calibration.center[1]) * h
+                    # Vertical movement of the face centre, in 640x480
+                    # reference pixels (independent of capture resolution).
+                    dy = (center[1] - calibration.center[1]) * REFERENCE_HEIGHT
 
                     now = time.time()
                     if calibration.displaced:
@@ -827,20 +875,58 @@ def main():
                 calibration.reset(CALIBRATION_TIME)
             elif key == ord("p"):
                 privacy_mode = not privacy_mode
-            # stop tracking for a bit
-            # waits for key "k" to be re-typed
+            # stop tracking for a bit: release the camera so it really powers
+            # down, then reopen and recalibrate when the user resumes.
             elif key == ord("k"):
                 scroll_ramp.reset()
                 last_scroll_time = time.time()
+                cv2.putText(
+                    frame,
+                    "Paused - press 'k' to resume (recalibrates)",
+                    (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+                cv2.imshow(WINDOW_NAME, frame)
+                cap.release()
+
                 resumed = False
-                while not resumed and window_is_open():
-                    stop_key = cv2.waitKey(1) & 0xFF
+                while window_is_open():
+                    stop_key = cv2.waitKey(50) & 0xFF
                     if stop_key == ord("k"):
                         resumed = True
-                    elif stop_key == ord("q"):
+                        break
+                    if stop_key == ord("q"):
                         break
                 if not resumed:
                     break
+
+                cap = open_camera()
+                if not cap.isOpened():
+                    print("Could not reopen the webcam after pause.")
+                    break
+
+                calibration.reset(CALIBRATION_TIME)
+                scroll_ramp.reset()
+                last_scroll_time = time.time()
+                last_face_seen = time.monotonic()
+                missing_frames = 0
+                hand_check_frame = 0
+                hand_gesture_checks = 0
+                hand_release_checks = HAND_RELEASE_CHECKS
+                hand_latched = False
+                last_hand_landmarks = []
+                last_hand_ok = []
+
+            # Frame limiter: TARGET_FPS normally, IDLE_FPS while no face is
+            # around. The camera itself is already asked for TARGET_FPS.
+            idle = time.monotonic() - last_face_seen > IDLE_AFTER_SECONDS
+            target_period = 1.0 / (IDLE_FPS if idle else TARGET_FPS)
+            remaining = target_period - (time.monotonic() - frame_start)
+            if remaining > 0:
+                time.sleep(remaining)
 
     finally:
         cap.release()
