@@ -7,7 +7,8 @@ via MediaPipe FaceLandmarker (Tasks API). See README.md for setup and usage.
 LazyRead is a fork of the original AutoScroller "eye tracking" demo. That
 demo averaged a few eye-contour landmarks, but those points move with the
 head, so the real control signal has always been the face position. This
-version uses the face-box centre directly and does not read the eye landmarks.
+version uses the face-box centre for scrolling; the eye blendshapes are only
+used for the eyes-on-screen gate.
 """
 
 import ctypes
@@ -102,7 +103,7 @@ PRIVACY_BOX_COLOR = (35, 35, 35)  # BGR dark gray
 PRIVACY_FACE_PADDING = 0.30  # expand the face box to cover hair/ears/chin
 PRIVACY_PIXEL_BLOCK = 16  # pixelation block size, in pixels
 
-SCROLL_UP_THRESHOLD = 7.8  # 640x480 reference pixels
+SCROLL_UP_THRESHOLD = 7.0  # 640x480 reference pixels
 SCROLL_DOWN_THRESHOLD = 7.5  # 640x480 reference pixels
 COOLDOWN = 0.4  # seconds between scroll actions (prevents spamming)
 
@@ -127,6 +128,38 @@ HAND_MIN_CONFIDENCE = 0.7  # handedness score reported by the model
 HAND_CHECK_EVERY = 4  # run the hand model every N frames (saves CPU)
 HAND_CONFIRM_CHECKS = 3  # consecutive positive checks needed to trigger
 HAND_RELEASE_CHECKS = 3  # consecutive negative checks needed to re-arm
+
+LEFT_EYE_INDICES = [33, 133, 160, 159, 158, 144, 153, 145, 246]
+RIGHT_EYE_INDICES = [362, 263, 387, 386, 385, 373, 380, 374, 466]
+IRIS_INDICES = list(range(468, 478))  # included in the 478-landmark model
+
+# Eyes-on-screen gate. Uses the MediaPipe face blendshapes eyeLook* and
+# eyeBlink*: if the eyes are not roughly on the screen, scrolling is paused
+# even though the face is still tracked.
+ENABLE_GAZE_GATE = True
+# Thresholds must sit between the on-screen and away distributions, with a
+# margin: setting them at the on-screen maximum (e.g. down 0.15, blink 0.08)
+# makes normal jitter or a slight eyelid movement look like "away".
+# Measured session: on screen L~0.2-0.3, U~0.1, D~0.15, B~0.05;
+# sideways L~0.8; looking down D~0.42; eyes closed B~0.58.
+GAZE_LATERAL_MAX = 0.65  # on 0.24-0.33, look-up 0.45-0.63, sideways 0.72+
+GAZE_DOWN_MAX = 0.30  # eyeLookDown: blocks looking down (keyboard/phone)
+GAZE_UP_MAX = 0.80  # eyeLookUp: allow looking up (needed for scroll-up)
+GAZE_BLINK_MAX = 0.35  # open ~0.06, closed ~0.58
+GAZE_ON_FRAMES = 3  # consecutive on-screen frames needed to enable scrolling
+GAZE_OFF_FRAMES = 2  # consecutive off-screen frames needed to pause scrolling
+GAZE_BLINK_HOLD_FRAMES = 10  # long blink/closed eyes -> pause
+GAZE_SMOOTHING = 0.5  # EMA factor (0 = no smoothing, 1 = frozen)
+GAZE_DEBUG = False  # draw the live gaze metrics; set False after tuning
+
+# Head-pitch gate: looking down at the keyboard/phone usually tilts the head,
+# which the eye blendshapes alone do not capture. The pitch baseline is taken
+# during the initial 2 s calibration. Positive pitch = head down.
+ENABLE_HEAD_GATE = True
+HEAD_PITCH_DOWN_MAX_DEG = 12.0  # block a clear downward tilt
+HEAD_PITCH_UP_MAX_DEG = 35.0  # block only an extreme upward tilt
+HEAD_UP_FREE_DEG = 5.0  # head clearly up: ignore the eye up/down gate (scroll-up)
+
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
@@ -258,8 +291,7 @@ def _windows_ctrl_checker():
 
 def _macos_ctrl_checker():
     framework = (
-        "/System/Library/Frameworks/ApplicationServices.framework/"
-        "ApplicationServices"
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
     )
     try:
         lib = ctypes.CDLL(framework)
@@ -511,6 +543,146 @@ class Calibration:
         )
 
 
+def get_eye_points(landmarks, indices, w, h):
+    return np.array(
+        [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in indices]
+    )
+
+
+def gaze_metrics(blendshapes):
+    """Return (lateral, up, down, blink) gaze magnitudes from blendshapes.
+
+    lateral = eyeLookIn + eyeLookOut, averaged over both eyes (0 = centred,
+    high = looking sideways). up/down are the separate eyeLookUp and
+    eyeLookDown magnitudes, averaged over both eyes. blink is the average
+    eyeBlink score.
+    """
+    scores = {c.category_name: c.score for c in blendshapes}
+    lateral = (
+        scores.get("eyeLookInLeft", 0.0)
+        + scores.get("eyeLookOutLeft", 0.0)
+        + scores.get("eyeLookInRight", 0.0)
+        + scores.get("eyeLookOutRight", 0.0)
+    ) / 2.0
+    up = (scores.get("eyeLookUpLeft", 0.0) + scores.get("eyeLookUpRight", 0.0)) / 2.0
+    down = (
+        scores.get("eyeLookDownLeft", 0.0) + scores.get("eyeLookDownRight", 0.0)
+    ) / 2.0
+    blink = (scores.get("eyeBlinkLeft", 0.0) + scores.get("eyeBlinkRight", 0.0)) / 2.0
+    return lateral, up, down, blink
+
+
+def head_pose_from_matrix(matrix):
+    """Return (pitch, roll, yaw) in degrees from a 4x4 facial transform.
+
+    MediaPipe uses X right, Y up, Z towards the camera: pitch is the rotation
+    around X (nodding), yaw around Y (turning left/right), roll around Z.
+    """
+    rotation = np.asarray(matrix, dtype=float).reshape(4, 4)[:3, :3]
+    sy = float(np.hypot(rotation[0, 0], rotation[1, 0]))
+    pitch = float(np.degrees(np.arctan2(rotation[2, 1], rotation[2, 2])))
+    yaw = float(np.degrees(np.arctan2(-rotation[2, 0], sy)))
+    roll = float(np.degrees(np.arctan2(rotation[1, 0], rotation[0, 0])))
+    return pitch, roll, yaw
+
+
+class GazeGate:
+    """Decide whether the eyes are looking at the screen.
+
+    Metrics are smoothed with an EMA and the state has short hysteresis, so a
+    glance or a blink does not immediately stop/start scrolling.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.on = False
+        self.on_frames = 0
+        self.off_frames = 0
+        self.closed_frames = 0
+        self.lateral = 0.0
+        self.up = 0.0
+        self.down = 0.0
+        self.vertical = 0.0  # up + down, kept for display
+        self.blink = 0.0
+        self.raw_lateral = 0.0
+        self.raw_up = 0.0
+        self.raw_down = 0.0
+        self.raw_vertical = 0.0
+        self.raw_blink = 0.0
+        self.pitch = 0.0
+        self.baseline_pitch = None
+        self.pitch_samples = []
+        self.head_up = False
+        self.head_down = False
+        self.samples = 0
+
+    def set_pitch(self, pitch):
+        """Update the current head pitch; collect samples until calibration."""
+        self.pitch = pitch
+        if self.baseline_pitch is None:
+            self.pitch_samples.append(pitch)
+
+    def lock_baseline(self):
+        """Freeze the head-pitch baseline after the face calibration."""
+        if self.pitch_samples:
+            self.baseline_pitch = float(np.median(np.asarray(self.pitch_samples)))
+
+    def update(self, blendshapes):
+        lateral, up, down, blink = gaze_metrics(blendshapes)
+        self.raw_lateral = lateral
+        self.raw_up = up
+        self.raw_down = down
+        self.raw_vertical = up + down
+        self.raw_blink = blink
+        if self.samples == 0:
+            self.lateral, self.up, self.down, self.blink = lateral, up, down, blink
+        else:
+            alpha = GAZE_SMOOTHING
+            self.lateral = alpha * self.lateral + (1.0 - alpha) * lateral
+            self.up = alpha * self.up + (1.0 - alpha) * up
+            self.down = alpha * self.down + (1.0 - alpha) * down
+            self.blink = alpha * self.blink + (1.0 - alpha) * blink
+        self.vertical = self.up + self.down
+        self.samples += 1
+
+        if self.blink > GAZE_BLINK_MAX:
+            # Short blink: keep the current state. Long closure: pause.
+            self.closed_frames += 1
+            if self.closed_frames >= GAZE_BLINK_HOLD_FRAMES:
+                self.on = False
+            return self.on
+        self.closed_frames = 0
+
+        head_ok = True
+        head_up = False
+        head_down = False
+        if ENABLE_HEAD_GATE and self.baseline_pitch is not None:
+            delta = self.pitch - self.baseline_pitch
+            head_up = delta < -HEAD_UP_FREE_DEG
+            head_down = delta > HEAD_PITCH_DOWN_MAX_DEG
+            head_ok = not head_down and delta >= -HEAD_PITCH_UP_MAX_DEG
+        self.head_up = head_up
+        self.head_down = head_down
+
+        # When the head is clearly up (scroll-up gesture), the eyeLookDown
+        # score can rise as a pose artefact; ignore the eye vertical gate there.
+        vertical_ok = head_up or (self.down <= GAZE_DOWN_MAX and self.up <= GAZE_UP_MAX)
+        looking = self.lateral <= GAZE_LATERAL_MAX and vertical_ok and head_ok
+        if looking:
+            self.on_frames += 1
+            self.off_frames = 0
+            if not self.on and self.on_frames >= GAZE_ON_FRAMES:
+                self.on = True
+        else:
+            self.off_frames += 1
+            self.on_frames = 0
+            if self.on and self.off_frames >= GAZE_OFF_FRAMES:
+                self.on = False
+        return self.on
+
+
 def open_camera(index=CAMERA_INDEX):
     """Open the webcam with the low-power capture settings."""
     cap = cv2.VideoCapture(index)
@@ -540,6 +712,8 @@ def main():
         min_face_detection_confidence=0.6,
         min_face_presence_confidence=0.6,
         min_tracking_confidence=0.6,
+        output_face_blendshapes=ENABLE_GAZE_GATE,
+        output_facial_transformation_matrixes=ENABLE_GAZE_GATE and ENABLE_HEAD_GATE,
     )
 
     hand_options = vision.HandLandmarkerOptions(
@@ -561,10 +735,12 @@ def main():
 
     calibration = Calibration()
     scroll_ramp = ScrollRamp()
+    gaze_gate = GazeGate()
     last_scroll_time = 0.0
     last_timestamp_ms = 0
     missing_frames = 0
     last_face_seen = time.monotonic()
+    last_gaze_print = 0.0
 
     hand_check_frame = 0
     hand_gesture_checks = 0
@@ -656,10 +832,73 @@ def main():
                 # Face found again after a loss: the old baseline is meaningless.
                 if missing_frames >= FACE_LOST_FRAMES:
                     calibration.reset(RECALIBRATION_TIME)
+                    gaze_gate.reset()
                     last_scroll_time = time.time()
                 missing_frames = 0
 
                 landmarks = results.face_landmarks[0]
+                left_eye = get_eye_points(landmarks, LEFT_EYE_INDICES, w, h)
+                right_eye = get_eye_points(landmarks, RIGHT_EYE_INDICES, w, h)
+
+                if ENABLE_HEAD_GATE and getattr(
+                    results, "facial_transformation_matrixes", None
+                ):
+                    pitch, _roll, _yaw = head_pose_from_matrix(
+                        results.facial_transformation_matrixes[0]
+                    )
+                    gaze_gate.set_pitch(pitch)
+
+                # Eyes-on-screen gate. Fail open if blendshapes are missing.
+                if ENABLE_GAZE_GATE and getattr(results, "face_blendshapes", None):
+                    gaze_on = gaze_gate.update(results.face_blendshapes[0])
+                else:
+                    gaze_on = True
+
+                # Immediate hard block only for a clear downward tilt (or an
+                # extreme upward one). A normal head-up pose must pass.
+                head_off = False
+                if ENABLE_HEAD_GATE and gaze_gate.baseline_pitch is not None:
+                    head_off = gaze_gate.head_down or (
+                        gaze_gate.pitch - gaze_gate.baseline_pitch
+                        < -HEAD_PITCH_UP_MAX_DEG
+                    )
+
+                # Same idea for the raw eye metrics: block the first frame of
+                # a clear look down/sideways, before the EMA crosses. While the
+                # head is clearly up, ignore the eye down/up gate (scroll-up).
+                gaze_raw_off = ENABLE_GAZE_GATE and (
+                    gaze_gate.raw_lateral > GAZE_LATERAL_MAX
+                    or (
+                        not gaze_gate.head_up
+                        and (
+                            gaze_gate.raw_down > GAZE_DOWN_MAX
+                            or gaze_gate.raw_up > GAZE_UP_MAX
+                        )
+                    )
+                )
+
+                if GAZE_DEBUG and time.monotonic() - last_gaze_print >= 1.0:
+                    last_gaze_print = time.monotonic()
+                    base = (
+                        "-"
+                        if gaze_gate.baseline_pitch is None
+                        else f"{gaze_gate.baseline_pitch:.1f}"
+                    )
+                    print(
+                        f"gaze raw L={gaze_gate.raw_lateral:.2f} "
+                        f"U={gaze_gate.raw_up:.2f} "
+                        f"D={gaze_gate.raw_down:.2f} "
+                        f"B={gaze_gate.raw_blink:.2f} | "
+                        f"filt L={gaze_gate.lateral:.2f} "
+                        f"U={gaze_gate.up:.2f} "
+                        f"D={gaze_gate.down:.2f} "
+                        f"B={gaze_gate.blink:.2f} | "
+                        f"pitch={gaze_gate.pitch:.1f} base={base} "
+                        f"hu={int(gaze_gate.head_up)} "
+                        f"hd={int(gaze_gate.head_down)} | "
+                        f"dmax={GAZE_DOWN_MAX:.2f} umax={GAZE_UP_MAX:.2f} | "
+                        f"on={gaze_gate.on}"
+                    )
 
                 box = get_face_box(landmarks, w, h)
                 cx, cy, bw, bh = box_center_size(box)
@@ -670,15 +909,27 @@ def main():
                 # the tracking boxes are drawn on top of it afterwards.
                 if privacy_mode:
                     px0, py0, px1, py1 = privacy_box(box, w, h)
-                    cv2.rectangle(
-                        frame, (px0, py0), (px1, py1), PRIVACY_BOX_COLOR, -1
-                    )
+                    cv2.rectangle(frame, (px0, py0), (px1, py1), PRIVACY_BOX_COLOR, -1)
+
+                if not privacy_mode:
+                    for point in left_eye:
+                        cv2.circle(frame, tuple(point), 2, (0, 255, 0), -1)
+                    for point in right_eye:
+                        cv2.circle(frame, tuple(point), 2, (0, 255, 0), -1)
+                    if len(landmarks) > IRIS_INDICES[-1]:
+                        for idx in IRIS_INDICES:
+                            point = (
+                                int(landmarks[idx].x * w),
+                                int(landmarks[idx].y * h),
+                            )
+                            cv2.circle(frame, point, 1, (0, 255, 255), -1)
 
                 if not calibration.done:
                     scroll_ramp.reset()
                     calibration.add_sample(center, size)
 
                     if calibration.try_lock():
+                        gaze_gate.lock_baseline()
                         last_scroll_time = time.time()
                         cv2.putText(
                             frame,
@@ -767,7 +1018,20 @@ def main():
                     dy = (center[1] - calibration.center[1]) * REFERENCE_HEIGHT
 
                     now = time.time()
-                    if calibration.displaced:
+                    if not gaze_on or head_off or gaze_raw_off:
+                        # The face is tracked, but the eyes/head are not on
+                        # the screen: keep everything ready without scrolling.
+                        scroll_ramp.reset()
+                        cv2.putText(
+                            frame,
+                            "Look at the screen",
+                            (50, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 165, 255),
+                            2,
+                        )
+                    elif calibration.displaced:
                         # Head is already drifting out of the area: wait for the
                         # re-lock counter instead of scrolling on a stale reference.
                         scroll_ramp.reset()
@@ -859,6 +1123,53 @@ def main():
                     1,
                 )
 
+            if GAZE_DEBUG and ENABLE_GAZE_GATE:
+                y0 = max(0, h - 108)
+                x1 = min(w - 1, 40 + 440)
+                cv2.rectangle(frame, (40, y0), (x1, y0 + 76), (0, 0, 0), -1)
+                cv2.putText(
+                    frame,
+                    f"raw  L={gaze_gate.raw_lateral:.2f} "
+                    f"U={gaze_gate.raw_up:.2f} "
+                    f"D={gaze_gate.raw_down:.2f} "
+                    f"B={gaze_gate.raw_blink:.2f}",
+                    (48, y0 + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 255),
+                    1,
+                )
+                cv2.putText(
+                    frame,
+                    f"filt L={gaze_gate.lateral:.2f} "
+                    f"U={gaze_gate.up:.2f} "
+                    f"D={gaze_gate.down:.2f} "
+                    f"B={gaze_gate.blink:.2f} "
+                    f"on={int(gaze_gate.on)}",
+                    (48, y0 + 38),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 255),
+                    1,
+                )
+                if ENABLE_HEAD_GATE:
+                    base = (
+                        "-"
+                        if gaze_gate.baseline_pitch is None
+                        else f"{gaze_gate.baseline_pitch:.1f}"
+                    )
+                    cv2.putText(
+                        frame,
+                        f"pitch={gaze_gate.pitch:.1f} base={base} "
+                        f"hu={int(gaze_gate.head_up)} "
+                        f"hd={int(gaze_gate.head_down)}",
+                        (48, y0 + 58),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 255),
+                        1,
+                    )
+
             # Once the X button destroys the window, the next imshow would
             # recreate it (with a fresh size): stop before that happens.
             if window_ready and not window_is_open():
@@ -873,6 +1184,7 @@ def main():
                 break
             elif key == ord("r"):
                 calibration.reset(CALIBRATION_TIME)
+                gaze_gate.reset()
             elif key == ord("p"):
                 privacy_mode = not privacy_mode
             # stop tracking for a bit: release the camera so it really powers
@@ -910,6 +1222,7 @@ def main():
 
                 calibration.reset(CALIBRATION_TIME)
                 scroll_ramp.reset()
+                gaze_gate.reset()
                 last_scroll_time = time.time()
                 last_face_seen = time.monotonic()
                 missing_frames = 0
