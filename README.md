@@ -49,6 +49,7 @@ Hand landmarks are drawn too: **green dots** mean the open-hand gesture was reco
 - While tracking, the **gray box is the tolerance container**: small sideways shifts inside it are ignored. The thin yellow box is the calibrated face reference and the green box is where the face is now.
 - Small, deliberate up/down **head** movements trigger scrolling; moving only your eyes (gaze) has little effect. Normal blinking won't trigger anything.
 - **Hand re-calibration:** raise your hand with all five fingers extended and the palm (or back of the hand) facing the camera, like a "stop" gesture, and hold it for a moment. Green landmark dots confirm the pose; orange dots mean it was not recognised.
+- **Ctrl pauses scrolling:** while Ctrl is held, no wheel events are sent, so browser/PDF zoom shortcuts (Ctrl+wheel) do not fire. Release Ctrl to resume. Works on Windows, macOS and Unix/X11; on Wayland the global key state may not be readable, in which case the guard is simply inactive.
 - If scrolling feels too sensitive or too sluggish, tweak these constants near the top of `LazyRead.py`:
   - `SCROLL_UP_THRESHOLD` / `SCROLL_DOWN_THRESHOLD` — how far your **face** must move (in pixels, measured from the face box) to trigger a scroll
   - `SCROLL_AMOUNT` — base scroll step; `SCROLL_RAMP_STEP_MS` / `SCROLL_MAX_EXPONENT` control the acceleration (up to 16x)
@@ -66,6 +67,7 @@ Hand landmarks are drawn too: **green dots** mean the open-hand gesture was reco
 ## What changed from AutoScroller
 - Rebranded as **LazyRead**: the entry point is now `LazyRead.py` and the preview window is titled `LazyRead`.
 - Closing the preview window with the X button now exits cleanly instead of letting `imshow` recreate it.
+- Scrolling pauses while Ctrl is held, so Ctrl+wheel does not zoom the page being scrolled.
 - Added a lateral tolerance container: small sideways head movements are ignored, while a real lateral shift re-locks the vertical baseline automatically.
 - Removed dead code (`locked_left_eye` / `locked_right_eye` were computed but never used).
 - Fixed structure: previously the capture loop ran at import time regardless of `__main__`, and cleanup only ran inside the `__main__` guard — this could leak the camera handle. Now everything is wrapped in `main()` and released in a `finally` block, so the webcam is released even if an error occurs.

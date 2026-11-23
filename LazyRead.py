@@ -10,7 +10,9 @@ head, so the real control signal has always been the face position. This
 version uses the face-box centre directly and does not read the eye landmarks.
 """
 
+import ctypes
 import os
+import sys
 import time
 import urllib.request
 from collections import deque
@@ -123,6 +125,7 @@ MODEL_HAND_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "models", "hand_landmarker.task"
 )
 WINDOW_NAME = "LazyRead"  # OpenCV preview window
+VK_CONTROL = 0x11  # Win32 virtual-key code for the Ctrl key
 pyautogui.FAILSAFE = True  # move mouse to a screen corner to abort pyautogui
 
 
@@ -204,6 +207,104 @@ def window_is_open(name=WINDOW_NAME):
         return cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE) >= 1
     except cv2.error:
         # The window handle is already gone.
+        return False
+
+
+def _windows_ctrl_checker():
+    user32 = ctypes.windll.user32
+    return lambda: bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+
+
+def _macos_ctrl_checker():
+    framework = (
+        "/System/Library/Frameworks/ApplicationServices.framework/"
+        "ApplicationServices"
+    )
+    try:
+        lib = ctypes.CDLL(framework)
+    except OSError:
+        return None
+    lib.CGEventSourceKeyState.argtypes = [ctypes.c_int32, ctypes.c_uint16]
+    lib.CGEventSourceKeyState.restype = ctypes.c_bool
+    # 1 = kCGEventSourceStateHIDSystemState; 0x3B/0x3E = left/right Control.
+    return lambda: bool(
+        lib.CGEventSourceKeyState(1, 0x3B) or lib.CGEventSourceKeyState(1, 0x3E)
+    )
+
+
+def _x11_ctrl_checker():
+    import ctypes.util
+
+    candidates = [ctypes.util.find_library("X11"), "libX11.so.6", "libX11.so"]
+    x11 = None
+    for name in candidates:
+        if not name:
+            continue
+        try:
+            x11 = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if x11 is None:
+        return None
+
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return None
+
+    x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+    keycodes = [
+        x11.XKeysymToKeycode(display, 0xFFE3),  # Control_L
+        x11.XKeysymToKeycode(display, 0xFFE4),  # Control_R
+    ]
+    keycodes = [keycode for keycode in keycodes if keycode]
+    if not keycodes:
+        return None
+
+    x11.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte)]
+    x11.XQueryKeymap.restype = ctypes.c_int
+    keys = (ctypes.c_ubyte * 32)()
+
+    def check():
+        if not x11.XQueryKeymap(display, keys):
+            return False
+        return any(keys[keycode // 8] & (1 << (keycode % 8)) for keycode in keycodes)
+
+    return check
+
+
+_ctrl_checker = None
+
+
+def _build_ctrl_checker():
+    if os.name == "nt":
+        return _windows_ctrl_checker()
+    if sys.platform == "darwin":
+        return _macos_ctrl_checker()
+    if os.name == "posix":
+        # Linux and other Unix systems with an X server / XWayland.
+        return _x11_ctrl_checker()
+    return None
+
+
+def ctrl_is_down():
+    """True while the physical Ctrl key is held.
+
+    Uses the global key state: GetAsyncKeyState on Windows, CGEventSource on
+    macOS and XQueryKeymap on Unix/X11. Wheel events sent while Ctrl is down
+    are interpreted as zoom by browsers, PDF viewers and similar apps, so
+    scrolling is paused until Ctrl is released. On platforms where the global
+    key state is not available (e.g. some Wayland sessions) this returns False.
+    """
+    global _ctrl_checker
+    if _ctrl_checker is None:
+        _ctrl_checker = _build_ctrl_checker() or (lambda: False)
+    try:
+        return bool(_ctrl_checker())
+    except (AttributeError, OSError, ValueError):
         return False
 
 
@@ -595,22 +696,43 @@ def main():
                             else 0
                         )
 
-                        direction, exponent = scroll_ramp.step(
-                            direction, int(now * 1000)
-                        )
-
-                        if direction and now - last_scroll_time > COOLDOWN:
-                            pyautogui.scroll(direction * (SCROLL_AMOUNT << exponent))
-                            last_scroll_time = now
-                            cv2.putText(
-                                frame,
-                                ("Scrolling down" if direction < 0 else "Scrolling up"),
-                                (50, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.7,
-                                (0, 255, 0) if direction < 0 else (0, 0, 255),
-                                2,
+                        if ctrl_is_down():
+                            # Ctrl+wheel zooms the active app instead of
+                            # scrolling: pause until the key is released.
+                            scroll_ramp.reset()
+                            if direction:
+                                cv2.putText(
+                                    frame,
+                                    "Ctrl held - scrolling paused",
+                                    (50, 50),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.7,
+                                    (0, 165, 255),
+                                    2,
+                                )
+                        else:
+                            direction, exponent = scroll_ramp.step(
+                                direction, int(now * 1000)
                             )
+
+                            if direction and now - last_scroll_time > COOLDOWN:
+                                pyautogui.scroll(
+                                    direction * (SCROLL_AMOUNT << exponent)
+                                )
+                                last_scroll_time = now
+                                cv2.putText(
+                                    frame,
+                                    (
+                                        "Scrolling down"
+                                        if direction < 0
+                                        else "Scrolling up"
+                                    ),
+                                    (50, 50),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.7,
+                                    (0, 255, 0) if direction < 0 else (0, 0, 255),
+                                    2,
+                                )
             else:
                 missing_frames += 1
                 cv2.putText(
