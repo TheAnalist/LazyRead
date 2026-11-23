@@ -1,8 +1,5 @@
 opencv-python
-opencv-python-headless
-opencv-contrib-python
-mediapipe
+mediapipe>=1.0.0
 pyautogui
 numpy
 websockets
-
