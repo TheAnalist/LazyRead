@@ -10,7 +10,8 @@ LazyRead scrolls your screen up/down by moving your head (the **face position**,
 3. After that, if your **face** moves up or down past a small threshold, it scrolls the active window accordingly. Moving only your eyes does not scroll, because the face box barely moves without the head.
 4. If your face leaves the tolerance container (a real sideways shift, or leaning in/out), it finds it again and **re-calibrates automatically** (about 1 second), so the old reference cannot cause false scrolling.
 5. You can also force a re-calibration by showing an **open hand with all five fingers extended** to the camera. Any other hand pose (fist, pointing, victory, thumbs-up, hand seen edge-on) is ignored.
-6. Press **`r`** any time to recalibrate, **`k`** to pause/resume, **`q`** to quit.
+6. The preview has a **privacy mode** (on by default): the detected face is covered by a dark gray box and the rest of the frame is pixelated, while the tracking boxes and labels stay sharp. It is designed for sharing demos without showing your face or room.
+7. Press **`r`** any time to recalibrate, **`k`** to pause/resume, **`p`** to toggle privacy, **`q`** to quit.
 
 ## Naming
 The original AutoScroller project started as an eye-tracking demo, but its implementation averaged the pixel position of a few **eye-contour landmarks** as the scroll signal. Those landmarks are attached to the head: when you raise or lower your face they all move together, while a change of gaze moves them only slightly (the iris/pupil was not tracked). The real control signal was therefore the **face position**, not where you are looking.
@@ -42,6 +43,7 @@ python LazyRead.py
 ```
  
 A window titled **LazyRead** will open showing your webcam feed with the face area drawn as a box.
+The preview starts in **privacy mode**: the face is covered by a dark gray box and the background is pixelated. Press **`p`** to see the normal feed.
 Hand landmarks are drawn too: **green dots** mean the open-hand gesture was recognised, **orange dots** mean the hand is doing something else and will not trigger a re-calibration.
  
 ## Usage tips
@@ -49,10 +51,11 @@ Hand landmarks are drawn too: **green dots** mean the open-hand gesture was reco
 - While tracking, the **gray box is the tolerance container**: small sideways shifts inside it are ignored. The thin yellow box is the calibrated face reference and the green box is where the face is now.
 - Small, deliberate up/down **head** movements trigger scrolling; moving only your eyes (gaze) has little effect. Normal blinking won't trigger anything.
 - **Hand re-calibration:** raise your hand with all five fingers extended and the palm (or back of the hand) facing the camera, like a "stop" gesture, and hold it for a moment. Green landmark dots confirm the pose; orange dots mean it was not recognised.
+- **Privacy mode (`p`):** the face is replaced by a solid gray box and everything else is pixelated. Detection still runs on the untouched frame, so scrolling is unaffected. Use it when recording a demo.
 - **Ctrl pauses scrolling:** while Ctrl is held, no wheel events are sent, so browser/PDF zoom shortcuts (Ctrl+wheel) do not fire. Release Ctrl to resume. Works on Windows, macOS and Unix/X11; on Wayland the global key state may not be readable, in which case the guard is simply inactive.
 - If scrolling feels too sensitive or too sluggish, tweak these constants near the top of `LazyRead.py`:
   - `SCROLL_UP_THRESHOLD` / `SCROLL_DOWN_THRESHOLD` — how far your **face** must move (in pixels, measured from the face box) to trigger a scroll
-  - `SCROLL_AMOUNT` — base scroll step; `SCROLL_RAMP_STEP_MS` / `SCROLL_MAX_EXPONENT` control the acceleration (up to 16x)
+  - `SCROLL_AMOUNT` — base scroll step; `SCROLL_RAMP_STEP_MS` / `SCROLL_MAX_EXPONENT` control the acceleration (up to 32x with the default exponent)
   - `COOLDOWN` — minimum time between scroll actions
   - `CALIBRATION_TIME` / `RECALIBRATION_TIME` — initial and automatic re-calibration duration
   - `FACE_CONTAINER_X_PX` — lateral tolerance in pixels (default 80): sideways movement inside ±this value is ignored, so normal head jitter does not cost a re-calibration; leaving it for a few frames re-locks the reference
@@ -62,12 +65,15 @@ Hand landmarks are drawn too: **green dots** mean the open-hand gesture was reco
   - `HAND_PALM_MIN_FACING` — how front-facing the palm must be (0–1, higher = stricter)
   - `HAND_CONFIRM_CHECKS` / `HAND_RELEASE_CHECKS` — consecutive checks needed to trigger and to re-arm the gesture
   - `HAND_CHECK_EVERY` — runs the hand model every N frames (1 = every frame, higher = lighter CPU)
+  - `PRIVACY_MODE` — start with the privacy preview on/off (toggle with `p`)
+  - `PRIVACY_BOX_COLOR`, `PRIVACY_FACE_PADDING`, `PRIVACY_PIXEL_BLOCK` — face-cover color, extra margin (30%) and pixelation block size (16 px)
 - Move your mouse to a screen corner at any time to trigger pyautogui's fail-safe and stop automated input immediately.
 
 ## What changed from AutoScroller
 - Rebranded as **LazyRead**: the entry point is now `LazyRead.py` and the preview window is titled `LazyRead`.
 - Closing the preview window with the X button now exits cleanly instead of letting `imshow` recreate it.
 - Scrolling pauses while Ctrl is held, so Ctrl+wheel does not zoom the page being scrolled.
+- Added a privacy preview (dark face box + pixelated background), toggled with `p`, for demos that must not show the user or the room.
 - Added a lateral tolerance container: small sideways head movements are ignored, while a real lateral shift re-locks the vertical baseline automatically.
 - Removed dead code (`locked_left_eye` / `locked_right_eye` were computed but never used).
 - Fixed structure: previously the capture loop ran at import time regardless of `__main__`, and cleanup only ran inside the `__main__` guard — this could leak the camera handle. Now everything is wrapped in `main()` and released in a `finally` block, so the webcam is released even if an error occurs.
@@ -98,6 +104,18 @@ LazyRead is a fork of [DissanayakeLYB/AutoScroller](https://github.com/Dissanaya
 - The trigger is **edge-based**: it fires after `HAND_CONFIRM_CHECKS` consecutive positive checks and stays latched until the hand disappears for `HAND_RELEASE_CHECKS` checks. This is why holding the open hand does not cause an endless recalibration loop.
 - A gesture shown during the initial calibration is ignored (the calibration is already running); lower the hand and show it again afterwards.
 - The hand model is the expensive one (~12 ms/frame with one hand, ~23 ms with two, vs ~3 ms for the face), so it runs every `HAND_CHECK_EVERY` frames (default 2). With the face model also running, the whole loop costs ~12–13 ms/frame on CPU.
+
+## Privacy mode
+- Detection, calibration and scrolling always use the **original frame**. Privacy mode only builds the preview: the frame is pixelated (block size `PRIVACY_PIXEL_BLOCK`), then the detected face is replaced by a solid `PRIVACY_BOX_COLOR` rectangle expanded by `PRIVACY_FACE_PADDING` (30%).
+- Boxes, labels, the calibration bar and the hand dots are drawn **after** the privacy step, so they stay sharp and the demo remains readable.
+- If no face is detected, the whole preview stays pixelated; nothing identifiable is shown.
+- Press `p` to toggle it at runtime; `PRIVACY_MODE` sets the initial state (default `True`).
+- The hand image is pixelated too, but its landmark dots remain visible. To hide tattoos or rings more aggressively, raise `PRIVACY_PIXEL_BLOCK` (e.g. 24).
+
+### Recording a demo
+- Keep privacy mode on and record the LazyRead window next to the page you are scrolling.
+- Use a clean browser profile (no personal tabs, bookmarks or notifications) and a plain background.
+- For the README a 5–8 s GIF under ~10 MB works well; strip metadata with `ffmpeg -map_metadata -1`.
 
 ## Known limitations
 - This is **face-position tracking, not gaze tracking**: nodding, leaning or shifting your posture scrolls the page, and moving your eyes alone has little effect. That is the intended behaviour of this project; automatic re-calibration resets the reference after large movements.

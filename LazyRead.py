@@ -84,6 +84,14 @@ FACE_SIZE_TOLERANCE = 0.30  # relative change of the box width/height
 FACE_MOVE_FRAMES = 6  # consecutive frames outside the container before re-locking
 FACE_LOST_FRAMES = 10  # consecutive frames without a face before resetting
 
+# Privacy mode for the preview: the detected face is replaced by a solid dark
+# box and the rest of the frame is pixelated, so a demo recording never shows
+# the user or the room. All tracking still runs on the untouched frame.
+PRIVACY_MODE = True
+PRIVACY_BOX_COLOR = (35, 35, 35)  # BGR dark gray
+PRIVACY_FACE_PADDING = 0.30  # expand the face box to cover hair/ears/chin
+PRIVACY_PIXEL_BLOCK = 16  # pixelation block size, in pixels
+
 SCROLL_UP_THRESHOLD = 7.8  # pixels
 SCROLL_DOWN_THRESHOLD = 7.5  # pixels
 COOLDOWN = 0.4  # seconds between scroll actions (prevents spamming)
@@ -198,6 +206,28 @@ def draw_progress(frame, progress, y=95):
     cv2.rectangle(frame, (x0, y), (x0 + width, y + height), (70, 70, 70), -1)
     cv2.rectangle(
         frame, (x0, y), (x0 + int(width * progress), y + height), (0, 255, 255), -1
+    )
+
+
+def pixelate(image, block=PRIVACY_PIXEL_BLOCK):
+    """Downscale and upscale with nearest-neighbour to hide image details."""
+    h, w = image.shape[:2]
+    small = cv2.resize(
+        image, (max(1, w // block), max(1, h // block)), interpolation=cv2.INTER_AREA
+    )
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+
+
+def privacy_box(box, w, h, padding=PRIVACY_FACE_PADDING):
+    """Face box expanded by a margin and clamped to the frame."""
+    x0, y0, x1, y1 = box
+    pad_x = (x1 - x0) * padding
+    pad_y = (y1 - y0) * padding
+    return (
+        max(0, int(x0 - pad_x)),
+        max(0, int(y0 - pad_y)),
+        min(w - 1, int(x1 + pad_x)),
+        min(h - 1, int(y1 + pad_y)),
     )
 
 
@@ -512,6 +542,7 @@ def main():
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     window_ready = False
+    privacy_mode = PRIVACY_MODE
 
     try:
         while cap.isOpened():
@@ -522,6 +553,12 @@ def main():
             frame = cv2.flip(frame, 1)  # mirror view, feels more natural
             h, w, _ = frame.shape
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Privacy mode only affects the preview: detection keeps using the
+            # untouched rgb_frame. Pixelation happens before the overlays so
+            # boxes, labels and hand dots stay sharp.
+            if privacy_mode:
+                frame = pixelate(frame, PRIVACY_PIXEL_BLOCK)
 
             # VIDEO mode needs strictly increasing timestamps.
             timestamp_ms = int(time.time() * 1000)
@@ -581,6 +618,14 @@ def main():
                 cx, cy, bw, bh = box_center_size(box)
                 center = (cx / w, cy / h)
                 size = (bw / w, bh / h)
+
+                # Solid gray box over the face (padded to cover hair/ears);
+                # the tracking boxes are drawn on top of it afterwards.
+                if privacy_mode:
+                    px0, py0, px1, py1 = privacy_box(box, w, h)
+                    cv2.rectangle(
+                        frame, (px0, py0), (px1, py1), PRIVACY_BOX_COLOR, -1
+                    )
 
                 if not calibration.done:
                     scroll_ramp.reset()
@@ -747,13 +792,24 @@ def main():
 
             cv2.putText(
                 frame,
-                "Press 'q' to quit, 'r' to recalibrate, 'k' to pause",
+                "Press 'q' to quit, 'r' to recalibrate, 'k' to pause, 'p' privacy",
                 (50, h - 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 (200, 200, 200),
                 1,
             )
+
+            if privacy_mode:
+                cv2.putText(
+                    frame,
+                    "Privacy: ON",
+                    (max(10, w - 150), 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (180, 180, 180),
+                    1,
+                )
 
             # Once the X button destroys the window, the next imshow would
             # recreate it (with a fresh size): stop before that happens.
@@ -769,6 +825,8 @@ def main():
                 break
             elif key == ord("r"):
                 calibration.reset(CALIBRATION_TIME)
+            elif key == ord("p"):
+                privacy_mode = not privacy_mode
             # stop tracking for a bit
             # waits for key "k" to be re-typed
             elif key == ord("k"):
